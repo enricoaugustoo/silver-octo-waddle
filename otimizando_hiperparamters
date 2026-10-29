@@ -1,0 +1,320 @@
+
+import json
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import differential_evolution
+
+from sklearn.ensemble import ExtraTreesRegressor
+from sklearn.model_selection import KFold, train_test_split, cross_val_score
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+from xgboost import XGBRegressor
+
+
+# ============================================================
+# CONFIGURAÇÕES
+# ============================================================
+
+ARQUIVO = Path("concrete_features.csv")
+ALVO = "Compressive_strength"
+
+SEED = 42
+N_FOLDS = 5
+
+# Busca inicial moderada; aumente após testar o funcionamento.
+MAXITER = 8
+POPSIZE = 5
+
+PASTA_RESULTADOS = Path("results_de")
+PASTA_RESULTADOS.mkdir(exist_ok=True)
+
+
+# ============================================================
+# DADOS
+# ============================================================
+
+if not ARQUIVO.exists():
+    ARQUIVO = Path("data") / "concrete_features.csv"
+
+if not ARQUIVO.exists():
+    raise FileNotFoundError(
+        "Não encontrei concrete_features.csv. "
+        "Ajuste a variável ARQUIVO."
+    )
+
+df = pd.read_csv(ARQUIVO)
+
+if ALVO not in df.columns:
+    raise ValueError(f"Coluna-alvo não encontrada: {ALVO}")
+
+# Utilizar somente variáveis numéricas.
+df = df.select_dtypes(include=[np.number]).copy()
+df = df.replace([np.inf, -np.inf], np.nan)
+df = df.dropna(subset=[ALVO])
+
+X = df.drop(columns=[ALVO])
+y = df[ALVO]
+
+if X.isna().any().any():
+    raise ValueError(
+        "Há valores ausentes nas variáveis preditoras. "
+        "Trate-os antes da otimização."
+    )
+
+# Reservar teste antes de otimizar.
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.20, random_state=SEED
+)
+
+# Divisões idênticas para todas as configurações.
+cv = KFold(
+    n_splits=N_FOLDS,
+    shuffle=True,
+    random_state=SEED
+)
+
+
+# ============================================================
+# FUNÇÕES AUXILIARES
+# ============================================================
+
+def rmse_cv(model):
+    """RMSE médio da validação cruzada nos dados de treinamento."""
+    scores = cross_val_score(
+        model,
+        X_train,
+        y_train,
+        cv=cv,
+        scoring="neg_root_mean_squared_error",
+        n_jobs=1
+    )
+    return -scores.mean()
+
+
+def avaliar_teste(nome, modelo):
+    """Ajusta nos dados de treinamento e avalia no teste reservado."""
+    modelo.fit(X_train, y_train)
+    pred = modelo.predict(X_test)
+
+    return {
+        "Modelo": nome,
+        "MAE": mean_absolute_error(y_test, pred),
+        "RMSE": np.sqrt(mean_squared_error(y_test, pred)),
+        "R2": r2_score(y_test, pred)
+    }
+
+
+# ============================================================
+# 1. EXTRA TREES
+# ============================================================
+
+def decodificar_extra_trees(v):
+    return {
+        "n_estimators": int(round(v[0])),
+        "max_depth": int(round(v[1])),
+        "min_samples_split": int(round(v[2])),
+        "min_samples_leaf": int(round(v[3])),
+        "max_features": float(v[4])
+    }
+
+
+def objetivo_extra_trees(v):
+    params = decodificar_extra_trees(v)
+
+    modelo = ExtraTreesRegressor(
+        **params,
+        random_state=SEED,
+        n_jobs=3
+    )
+
+    return rmse_cv(modelo)
+
+
+print("\n=== Extra Trees: configuração de referência ===")
+
+et_base = ExtraTreesRegressor(
+    n_estimators=300,
+    random_state=SEED,
+    n_jobs=3
+)
+
+resultados = [
+    avaliar_teste("Extra Trees - referência", et_base)
+]
+
+print("\n=== Extra Trees: otimização por DE ===")
+
+limites_et = [
+    (100, 600),  # n_estimators
+    (5, 40),     # max_depth
+    (2, 20),     # min_samples_split
+    (1, 10),     # min_samples_leaf
+    (0.5, 1.0)   # max_features
+]
+
+de_et = differential_evolution(
+    objetivo_extra_trees,
+    bounds=limites_et,
+    seed=SEED,
+    maxiter=MAXITER,
+    popsize=POPSIZE,
+    polish=False,
+    workers=1,
+    updating="deferred",
+    disp=True
+)
+
+params_et = decodificar_extra_trees(de_et.x)
+
+print("Melhores hiperparâmetros Extra Trees:")
+print(params_et)
+print(f"RMSE médio na busca: {de_et.fun:.5f}")
+
+et_otimizado = ExtraTreesRegressor(
+    **params_et,
+    random_state=SEED,
+    n_jobs=3
+)
+
+resultados.append(
+    avaliar_teste("Extra Trees - DE", et_otimizado)
+)
+
+
+# ============================================================
+# 2. XGBOOST
+# ============================================================
+
+def decodificar_xgb(v):
+    return {
+        "n_estimators": int(round(v[0])),
+        "max_depth": int(round(v[1])),
+        "learning_rate": float(v[2]),
+        "min_child_weight": float(v[3]),
+        "subsample": float(v[4]),
+        "colsample_bytree": float(v[5]),
+        "reg_lambda": float(v[6]),
+        "gamma": float(v[7])
+    }
+
+
+def objetivo_xgb(v):
+    params = decodificar_xgb(v)
+
+    modelo = XGBRegressor(
+        **params,
+        objective="reg:squarederror",
+        eval_metric="rmse",
+        random_state=SEED,
+        n_jobs=3,
+        verbosity=0
+    )
+
+    return rmse_cv(modelo)
+
+
+print("\n=== XGBoost: configuração de referência ===")
+
+xgb_base = XGBRegressor(
+    n_estimators=300,
+    max_depth=4,
+    learning_rate=0.05,
+    subsample=0.9,
+    colsample_bytree=0.9,
+    reg_lambda=1.0,
+    objective="reg:squarederror",
+    eval_metric="rmse",
+    random_state=SEED,
+    n_jobs=3,
+    verbosity=0
+)
+
+resultados.append(
+    avaliar_teste("XGBoost - referência", xgb_base)
+)
+
+print("\n=== XGBoost: otimização por DE ===")
+
+limites_xgb = [
+    (100, 700),    # n_estimators
+    (2, 10),       # max_depth
+    (0.01, 0.25),  # learning_rate
+    (1, 12),       # min_child_weight
+    (0.60, 1.0),   # subsample
+    (0.60, 1.0),   # colsample_bytree
+    (0.01, 20.0),  # reg_lambda
+    (0.0, 5.0)     # gamma
+]
+
+de_xgb = differential_evolution(
+    objetivo_xgb,
+    bounds=limites_xgb,
+    seed=SEED,
+    maxiter=MAXITER,
+    popsize=POPSIZE,
+    polish=False,
+    workers=1,
+    updating="deferred",
+    disp=True
+)
+
+params_xgb = decodificar_xgb(de_xgb.x)
+
+print("Melhores hiperparâmetros XGBoost:")
+print(params_xgb)
+print(f"RMSE médio na busca: {de_xgb.fun:.5f}")
+
+xgb_otimizado = XGBRegressor(
+    **params_xgb,
+    objective="reg:squarederror",
+    eval_metric="rmse",
+    random_state=SEED,
+    n_jobs=3,
+    verbosity=0
+)
+
+resultados.append(
+    avaliar_teste("XGBoost - DE", xgb_otimizado)
+)
+
+
+# ============================================================
+# 3. SALVAR E COMPARAR RESULTADOS
+# ============================================================
+
+df_resultados = pd.DataFrame(resultados)
+df_resultados = df_resultados.sort_values("RMSE")
+
+df_resultados.to_csv(
+    PASTA_RESULTADOS / "resultados_de_metricas.csv",
+    index=False,
+    encoding="utf-8-sig"
+)
+
+melhores = {
+    "Extra Trees": {
+        "hiperparametros": params_et,
+        "RMSE_CV_da_busca": float(de_et.fun)
+    },
+    "XGBoost": {
+        "hiperparametros": params_xgb,
+        "RMSE_CV_da_busca": float(de_xgb.fun)
+    }
+}
+
+with open(
+    PASTA_RESULTADOS / "melhores_hiperparametros_de.json",
+    "w",
+    encoding="utf-8"
+) as arquivo:
+    json.dump(melhores, arquivo, indent=4, ensure_ascii=False)
+
+print("\n=== COMPARAÇÃO NO TESTE RESERVADO ===")
+print(df_resultados.to_string(
+    index=False,
+    float_format=lambda x: f"{x:.5f}"
+))
+
+print(f"\nResultados salvos em: {PASTA_RESULTADOS.resolve()}")
